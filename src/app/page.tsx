@@ -460,16 +460,22 @@ function PlanGeneratorPanel() {
               <div className="font-semibold">
                 计划日历：{dayjs(monthToShow).format("YYYY年M月")}
               </div>
-              <button
-                type="button"
-                className="text-sm border rounded px-3 py-1 hover:bg-slate-50"
-                onClick={() => {
-                  const m = dayjs(selectedDate).format("YYYY-MM-01");
-                  setMonthToShow(m);
-                }}
-              >
-                跳到选中日期所在月
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="text-sm border rounded px-3 py-1 hover:bg-slate-50"
+                  onClick={() => setMonthToShow(dayjs(monthToShow).subtract(1, "month").format("YYYY-MM-01"))}
+                >
+                  上个月
+                </button>
+                <button
+                  type="button"
+                  className="text-sm border rounded px-3 py-1 hover:bg-slate-50"
+                  onClick={() => setMonthToShow(dayjs(monthToShow).add(1, "month").format("YYYY-MM-01"))}
+                >
+                  下个月
+                </button>
+              </div>
             </div>
 
             <CalendarGrid
@@ -507,6 +513,9 @@ function PlanGeneratorPanel() {
                         <div className="text-xs text-slate-500 mt-1">
                           类型：{it.type} / {it.durationHours}h
                         </div>
+                        {it.notes ? (
+                          <div className="text-xs text-slate-600 mt-2 whitespace-pre-line leading-relaxed">{it.notes}</div>
+                        ) : null}
                       </div>
                     </div>
                   ))}

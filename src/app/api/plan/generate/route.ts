@@ -135,18 +135,33 @@ const LlmItemsSchema = z
         // LLM 输出不保证严格等于 "work"，这里放宽解析，后端统一映射为 work
         type: z.string().optional(),
         durationHours: z.coerce.number().min(0.1).max(24),
+        notes: z.string().max(4000).optional(),
       })
     ),
   })
   .strict();
 
+function pickAnchorDates(availableDates: string[], segmentCount: number) {
+  if (!availableDates.length) return [];
+  const n = Math.min(Math.max(2, segmentCount), Math.min(7, availableDates.length));
+  if (n === 1) return [availableDates[0]];
+  const anchors: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const idx = Math.round((i / (n - 1)) * (availableDates.length - 1));
+    anchors.push(availableDates[idx]);
+  }
+  // 去重（极短列表时可能重复）
+  return Array.from(new Set(anchors));
+}
+
 function ensureItemsCoverage(args: {
   items: TaskItem[];
-  availableDates: string[];
+  requiredDates: string[];
   dailyHours: number;
   goalDescription: string;
+  minItemsPerDate: number;
 }): TaskItem[] {
-  const { items, availableDates, dailyHours, goalDescription } = args;
+  const { items, requiredDates, dailyHours, goalDescription, minItemsPerDate } = args;
   const byDate = new Map<string, number>();
   for (const it of items) {
     byDate.set(it.date, (byDate.get(it.date) ?? 0) + 1);
@@ -163,9 +178,9 @@ function ensureItemsCoverage(args: {
   };
 
   const next: TaskItem[] = [...items];
-  for (const date of availableDates) {
+  for (const date of requiredDates) {
     const count = byDate.get(date) ?? 0;
-    const need = Math.max(0, 2 - count); // 每个可用日期至少 2 条任务
+    const need = Math.max(0, minItemsPerDate - count);
     for (let i = 0; i < need; i++) {
       const list = fillTemplates[goalType] ?? fillTemplates.generic;
       const tpl = list[(count + i) % list.length];
@@ -189,8 +204,9 @@ async function generateItemsByLLM(args: {
   availableDates: string[];
   dailyHours: number;
   totalAvailableHours: number;
+  mode: "daily" | "segment";
 }): Promise<PlanResult["items"]> {
-  const { goalDescription, startDate, endDate, availableDates, dailyHours, totalAvailableHours } = args;
+  const { goalDescription, startDate, endDate, availableDates, dailyHours, totalAvailableHours, mode } = args;
 
   let apiKey = process.env.DASHSCOPE_API_KEY || process.env.AI_API_KEY;
   let baseUrl = process.env.DASHSCOPE_BASE_URL;
@@ -210,8 +226,13 @@ async function generateItemsByLLM(args: {
   const systemPrompt =
     "你是一个严谨的计划生成器。只能输出合法 JSON，不能输出任何解释/前言/markdown/多余文本。JSON 必须严格匹配 schema。不要在任务标题里写具体日期。";
 
+  const segmentCount = Math.min(7, Math.max(6, Math.ceil(availableDates.length / 10))); // 6-7 段
+  const anchorDates = mode === "segment" ? pickAnchorDates(availableDates, segmentCount) : [];
+
   const userPrompt = [
-    "根据以下输入生成一个“按日期落地”的计划（不需要里程碑，不需要阶段模板）。",
+    mode === "segment"
+      ? "根据以下输入生成一个“按关键时间节点落地”的阶段计划（最多 6-7 段）。每段对应一个时间节点，给出阶段标题+清单（notes）。"
+      : "根据以下输入生成一个“按日期落地”的日计划。",
     "",
     "输入：",
     `- 目标：${goalDescription}`,
@@ -219,22 +240,36 @@ async function generateItemsByLLM(args: {
     `- 避开周末：${args.avoidWeekends}`,
     `- 可用日期列表：${JSON.stringify(availableDates)}`,
     `- 可用日期数量：${availableDates.length}`,
+    ...(mode === "segment" ? [`- 关键节点日期（只能从中选择 date）：${JSON.stringify(anchorDates)}`] : []),
     `- 每个可用日的理论容量 dailyHours：${round2(dailyHours)}（不要明显超出）`,
     `- 区间总可用工时 totalAvailableHours：${round2(totalAvailableHours)}（所有 tasks 的 durationHours 之和尽量不超过它）`,
     "",
     "输出 JSON schema：",
     "{",
     '  "items": [',
-    '    { "date": "YYYY-MM-DD", "title": "中文可执行任务标题", "type": "work", "durationHours": number }',
+    mode === "segment"
+      ? '    { "date": "YYYY-MM-DD", "title": "阶段标题（中文）", "durationHours": number, "notes": "阶段清单/交付物（多行也行）" }'
+      : '    { "date": "YYYY-MM-DD", "title": "中文可执行任务标题", "durationHours": number }',
     "  ]",
     "}",
     "",
     "硬性约束：",
-    "1) items.date 必须严格属于可用日期列表，且 items 必须覆盖所有可用日期。",
-    "2) 每个可用日期至少输出 2 条任务、最多 4 条任务（让计划更细、更可执行）。",
-    "3) title 必须强相关目标，包含明确动作 + 交付物/验收点（例如：PPT大纲、答辩稿、材料清单、演练记录、修改列表等）。",
-    "4) durationHours 为每条任务的预计时长（小时），同一天的总和不要明显超过 dailyHours 的 1.2 倍。",
-    "5) 只输出 JSON，不要输出任何其它文本。",
+    ...(mode === "segment"
+      ? [
+          "1) items 只能使用给定的关键节点日期作为 date（必须严格属于关键节点列表）。",
+          "2) items 数量为 6-7 条（若关键节点不足则按实际数量输出）。",
+          "3) title 必须强相关目标，体现阶段性推进（例如：调研/方案/产出/检查/演练/交付）。",
+          "4) notes 必须包含可执行清单/交付物/验收点，尽量用多行或清单形式。",
+          "5) durationHours 为该阶段预计投入（小时），总和尽量不超过 totalAvailableHours。",
+          "6) 只输出 JSON，不要输出任何其它文本。",
+        ]
+      : [
+          "1) items.date 必须严格属于可用日期列表，且 items 必须覆盖所有可用日期。",
+          "2) 每个可用日期至少输出 2 条任务、最多 4 条任务。",
+          "3) title 必须强相关目标，包含明确动作 + 交付物/验收点。",
+          "4) durationHours 为每条任务预计时长（小时），同一天总和不要明显超过 dailyHours 的 1.2 倍。",
+          "5) 只输出 JSON，不要输出任何其它文本。",
+        ]),
     "",
     "开始生成 JSON。",
   ].join("\n");
@@ -292,6 +327,7 @@ async function generateItemsByLLM(args: {
       title: it.title,
       type: "work",
       durationHours: duration,
+      notes: it.notes,
     };
   });
   return items;
@@ -339,6 +375,8 @@ export async function POST(req: Request) {
     const dailyHours = spec.weeklyHours / (spec.avoidWeekends ? 5 : 7);
     const availableDates = await getAvailableDates(spec);
     totalAvailableHours = round2(availableDates.length * dailyHours);
+    const totalDays = iterateDates(spec.startDate, spec.endDate).length;
+    const mode: "daily" | "segment" = totalDays >= 21 ? "segment" : "daily";
 
     // 2) 可选：LLM 直接生成“按日期落地”的 items（不需要里程碑/模板）
     const pythonCfg = await loadDashscopeConfigFromPythonClient();
@@ -354,14 +392,22 @@ export async function POST(req: Request) {
           availableDates,
           dailyHours,
           totalAvailableHours,
+          mode,
         });
 
-        // 保证每个可用日期至少有一条任务，避免你看到“空洞/稀疏”的计划
+        // 覆盖策略：
+        // - daily：每个可用日期至少 2 条
+        // - segment：每个关键节点至少 1 条
+        const requiredDates =
+          mode === "segment"
+            ? pickAnchorDates(availableDates, Math.min(7, Math.max(6, Math.ceil(availableDates.length / 10))))
+            : availableDates;
         items = ensureItemsCoverage({
           items,
-          availableDates,
+          requiredDates,
           dailyHours,
           goalDescription: spec.description,
+          minItemsPerDate: mode === "segment" ? 1 : 2,
         });
 
         const plannedTotalHours = sumDurationHours(items);
@@ -390,12 +436,24 @@ export async function POST(req: Request) {
     }
 
     // 3) 兜底：直接按可用日期拆分成 daily tasks（保证“计划页有内容、能落到每天”）
-    const items = generateItemsBySplit({
-      goalDescription: spec.description,
-      availableDates,
-      dailyHours,
-      totalAvailableHours,
-    });
+    const items =
+      mode === "segment"
+        ? pickAnchorDates(availableDates, Math.min(7, Math.max(6, Math.ceil(availableDates.length / 10)))).map(
+            (date, i) => ({
+              id: `seg-${i}-${date}`,
+              date,
+              type: "work" as const,
+              title: `阶段 ${i + 1}：推进与检查（目标：${truncateTitle(spec.description, 18)}）`,
+              durationHours: round2((totalAvailableHours * 0.95) / Math.max(1, Math.min(7, Math.max(6, Math.ceil(availableDates.length / 10))))),
+              notes: "（兜底生成）建议：列出本阶段交付物/检查点/风险与下一步。",
+            })
+          )
+        : generateItemsBySplit({
+            goalDescription: spec.description,
+            availableDates,
+            dailyHours,
+            totalAvailableHours,
+          });
     const plannedTotalHours = sumDurationHours(items);
     const result: PlanResult = {
       items,
