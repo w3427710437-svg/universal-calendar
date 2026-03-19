@@ -33,6 +33,10 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# local LLM secrets (do not commit)
+../llm_client.py
+../llm_service.py
+
 # vercel
 .vercel
 
